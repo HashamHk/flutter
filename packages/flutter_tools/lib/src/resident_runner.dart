@@ -27,6 +27,8 @@ import 'build_system/targets/localizations.dart';
 import 'bundle.dart';
 import 'cache.dart';
 import 'compile.dart';
+import 'dart/language_version.dart';
+import 'dart/package_map.dart';
 import 'devfs.dart';
 import 'device.dart';
 import 'features.dart';
@@ -46,6 +48,7 @@ class FlutterDevice {
     TargetPlatform targetPlatform,
     ResidentCompiler generator,
     this.userIdentifier,
+    this.nullSafetyMode = NullSafetyMode.autodetect,
   }) : assert(buildInfo.trackWidgetCreation != null),
        generator = generator ?? ResidentCompiler(
          globals.artifacts.getArtifactPath(
@@ -70,7 +73,6 @@ class FlutterDevice {
   /// Create a [FlutterDevice] with optional code generation enabled.
   static Future<FlutterDevice> create(
     Device device, {
-    @required FlutterProject flutterProject,
     @required String target,
     @required BuildInfo buildInfo,
     @required Platform platform,
@@ -82,6 +84,7 @@ class FlutterDevice {
     String userIdentifier,
   }) async {
     ResidentCompiler generator;
+    NullSafetyMode nullSafetyMode = buildInfo.nullSafetyMode;
     final TargetPlatform targetPlatform = await device.targetPlatform;
     if (device.platformType == PlatformType.fuchsia) {
       targetModel = TargetModel.flutterRunner;
@@ -98,13 +101,34 @@ class FlutterDevice {
       if (buildInfo.nullSafetyMode == NullSafetyMode.unsound) {
         platformDillArtifact = Artifact.webPlatformKernelDill;
         extraFrontEndOptions = buildInfo.extraFrontEndOptions;
-      } else {
+      } else if (buildInfo.nullSafetyMode == NullSafetyMode.sound) {
         platformDillArtifact = Artifact.webPlatformSoundKernelDill;
-        extraFrontEndOptions = <String>[
-          ...?buildInfo?.extraFrontEndOptions,
-          if (!(buildInfo?.extraFrontEndOptions?.contains('--sound-null-safety') ?? false))
-            '--sound-null-safety'
-        ];
+        extraFrontEndOptions =  buildInfo.extraFrontEndOptions;
+      } else {
+        final PackageConfig packageConfig = await loadPackageConfigWithLogging(
+          globals.fs.file(buildInfo.packagesPath),
+          logger: globals.logger,
+        );
+        final File entrypointFile = globals.fs.file(target);
+        final LanguageVersion languageVersion = determineLanguageVersion(
+          entrypointFile,
+          packageConfig.packageOf(entrypointFile.absolute.uri),
+        );
+        if (languageVersion.major >= nullSafeVersion.major && languageVersion.minor >= nullSafeVersion.minor) {
+          platformDillArtifact = Artifact.webPlatformSoundKernelDill;
+          extraFrontEndOptions =  <String>[
+            ...?buildInfo.extraFrontEndOptions,
+            '--sound-null-safety',
+          ];
+          nullSafetyMode = NullSafetyMode.sound;
+        } else {
+          platformDillArtifact = Artifact.webPlatformKernelDill;
+          extraFrontEndOptions =  <String>[
+            ...?buildInfo.extraFrontEndOptions,
+            '--no-sound-null-safety',
+          ];
+          nullSafetyMode = NullSafetyMode.unsound;
+        }
       }
 
       generator = ResidentCompiler(
@@ -118,7 +142,7 @@ class FlutterDevice {
         initializeFromDill: getDefaultCachedKernelPath(
           trackWidgetCreation: buildInfo.trackWidgetCreation,
           dartDefines: buildInfo.dartDefines,
-          extraFrontEndOptions: extraFrontEndOptions
+          extraFrontEndOptions: extraFrontEndOptions,
         ),
         targetModel: TargetModel.dartdevc,
         extraFrontEndOptions: extraFrontEndOptions,
@@ -178,6 +202,7 @@ class FlutterDevice {
       generator: generator,
       buildInfo: buildInfo,
       userIdentifier: userIdentifier,
+      nullSafetyMode: nullSafetyMode,
     );
   }
 
@@ -185,6 +210,7 @@ class FlutterDevice {
   final ResidentCompiler generator;
   final BuildInfo buildInfo;
   final String userIdentifier;
+  final NullSafetyMode nullSafetyMode;
 
   DevFSWriter devFSWriter;
   Stream<Uri> observatoryUris;
@@ -288,7 +314,7 @@ class FlutterDevice {
     }, onDone: () {
       _isListeningForObservatoryUri = false;
       if (!completer.isCompleted && !isWaitingForVm) {
-        completer.completeError('connection to device ended too early');
+        completer.completeError(Exception('connection to device ended too early'));
       }
     });
     _isListeningForObservatoryUri = true;
@@ -670,7 +696,6 @@ class FlutterDevice {
   }) async {
     final Status devFSStatus = globals.logger.startProgress(
       'Syncing files to device ${device.name}...',
-      timeout: timeoutConfiguration.fastOperation,
     );
     UpdateFSReport report;
     try {
@@ -878,7 +903,6 @@ abstract class ResidentRunner {
       processManager: globals.processManager,
       projectDir: globals.fs.currentDirectory,
     );
-    globals.logger.printTrace('Starting incremental build...');
     _lastBuild = await globals.buildSystem.buildIncremental(
       const GenerateLocalizationsTarget(),
       _environment,
@@ -895,14 +919,6 @@ abstract class ResidentRunner {
       }
     }
     globals.logger.printTrace('complete');
-  }
-
-  /// Toggle whether canvaskit is being used for rendering, returning the new
-  /// state.
-  ///
-  /// Only supported on the web.
-  Future<bool> toggleCanvaskit() {
-    throw Exception('Canvaskit not supported by this runner.');
   }
 
   /// Write the SkSL shaders to a zip file in build directory.
@@ -1089,7 +1105,6 @@ abstract class ResidentRunner {
 
     final Status status = globals.logger.startProgress(
       'Taking screenshot for ${device.device.name}...',
-      timeout: timeoutConfiguration.fastOperation,
     );
     final File outputFile = globals.fsUtils.getUniqueFile(
       globals.fs.currentDirectory,
@@ -1237,7 +1252,6 @@ abstract class ResidentRunner {
       // This will wait for at least one flutter view before returning.
       final Status status = globals.logger.startProgress(
         'Waiting for ${device.device.name} to report its views...',
-        timeout: const Duration(milliseconds: 200),
       );
       try {
         await device.vmService.getFlutterViews();
